@@ -1,0 +1,204 @@
+Мы в своем проекте занимаемся разработкой сервера на C#. Этот сервер должен выдерживать очень высокие нагрузки, по этой причине мы стараемся написать код как можно оптимальней. C# редко ассоциируют с высокой производительностью, но если с умом подходить к разработке, то можно достичь очень даже неплохого уровня.
+
+Одним из недешевых процессов с точки зрения производительности является boxing и unboxing. Напоминалку о том, что это такое, можно найти <a href="http://msdn.microsoft.com/en-us/library/yz2be5wk.aspx">тут</a>.  Недавно я решил посмотреть весь IL код наших проектов и поискать инструкции box и unbox. Нашлось достаточно много участков, boxing'а в которых можно избежать легким движением руки. Все случаи, приводящие к ненужному boxing'у, очевидны, и допускаются по невнимательности в моменты концентрации на функциональности, а не на оптимизации. Я решил выписать наиболее часто встречающиеся случаи, чтобы не забывать о них, а затем автоматизировать их исправление. В данной статье и перечислены эти случаи.
+<habracut />
+Сразу сделаю ремарку: чаще всего проблемы производительности лежат на более высоком уровне, и прежде чем править весь лишний boxing, нужно привести код к такому состоянию, когда от этого будет толк. Всерьез задумываться о таких вещах как boxing имеет смысл, если вы действительно хотите выжать максимум из C#.
+
+Да простит меня русский язык, но далее в статье я буду использовать неожиданное для него слово "боксинг",  чтобы глаз не цеплялся лишний раз в попытке найти строчку кода. 
+
+Приступим.
+
+<h5>1. Передача value type переменных в методы String.Format, String.Concat и т.п.</h5>
+Первое место по количеству боксинга держат строковые операции. Благо, в нашем коде это встречалось в основном в форматировании сообщения для исключений. Основное правило для избежания боксинга  - это вызывать ToString() у value type переменной перед использованием в методах String.Format или при сложении строк. 
+
+То же самое, но в коде. Вместо:
+
+<source lang="cs">
+var id = Guid.NewGuid();
+var str1 = String.Format("Id {0}", id);
+var str2 = "Id " + id;
+</source>
+
+<source lang="cs">
+IL_0000: call valuetype [mscorlib]System.Guid [mscorlib]System.Guid::NewGuid()
+IL_0005: stloc.0
+IL_0006: ldstr "Id {0}"
+IL_000b: ldloc.0
+IL_000c: box [mscorlib]System.Guid
+IL_0011: call string [mscorlib]System.String::Format(string, object)
+IL_0016: pop
+IL_0017: ldstr "Id "
+IL_001c: ldloc.0
+IL_001d: box [mscorlib]System.Guid
+IL_0022: call string [mscorlib]System.String::Concat(object, object)
+</source>
+
+Нужно писать:
+
+<source lang="cs">
+var id = Guid.NewGuid();
+var str1 = String.Format("Id {0}", id.ToString());
+var str2 = "Id " + id.ToString();
+</source>
+
+<source lang="cs">
+IL_0000: call valuetype [mscorlib]System.Guid [mscorlib]System.Guid::NewGuid()
+IL_0005: stloc.0
+IL_0006: ldstr "Id {0}"
+IL_000b: ldloca.s id
+IL_000d: constrained. [mscorlib]System.Guid
+IL_0013: callvirt instance string [mscorlib]System.Object::ToString()
+IL_0018: call string [mscorlib]System.String::Format(string, object)
+IL_001d: pop
+IL_001e: ldstr "Id "
+IL_0023: ldloca.s id
+IL_0025: constrained. [mscorlib]System.Guid
+IL_002b: callvirt instance string [mscorlib]System.Object::ToString()
+IL_0030: call string [mscorlib]System.String::Concat(string, string)
+</source>
+
+Как мы видим, появляется инструкция constrained вместо box. <a href="http://msdn.microsoft.com/en-us/library/system.reflection.emit.opcodes.constrained(v=vs.110).aspx">Здесь</a> написано, что следующий вызов callvirt будет напрямую у переменной,  при условии, что <i>thisType</i> это value type, и есть реализация метода. Если же реализации метода нет, то всё равно произойдет боксинг.
+
+Неприятный момент заключается в том, что почти у всех стоит Resharper, который подсказывает, что вызов ToString() лишний.
+
+И еще насчет строк, а точнее их сложения. Иногда встречал код вроде:
+
+<source lang="cs">var str2 = str1 + '\t';</source>
+
+Есть ложное ощущение, что <code>char</code> без проблем сложится со строкой, но <code>char</code> - это value type, поэтому здесь тоже будет боксинг. В этом случае всё-таки лучше писать так:
+
+<source lang="cs">var str2 = str1 + "\t";</source>
+
+<h5>2. Вызов методов на generic переменных</h5>
+Второе место по количеству боксинга держат generic методы. Дело в том, что любой вызов метода на generic переменной вызывает боксинг, даже при условии, что  выставлен constraint <code>class</code>.
+
+Пример:
+
+<source lang="cs">
+public static Boolean Equals<T>(T x, T y)
+	where T : class 
+{
+	return x == y;
+}
+</source>
+
+Превращается в:
+
+<source lang="cs">
+IL_0000: ldarg.0
+IL_0001: box !!T
+IL_0006: ldarg.1
+IL_0007: box !!T
+IL_000c: ceq
+</source>
+
+На самом деле здесь не всё так плохо, так как данный IL код будет прооптимизирован JIT'ом, но случай занятный.  
+
+Положительным моментом является также то, что для вызова методов на generic переменных используется уже знакомая нам инструкция constrained, а это позволяет вызывать методы на value типах без боксинга.  Если же метод работает и с value типами и с reference типами, то, например, сравнение на null лучше писать так:
+
+<source lang="cs">
+if (!typeof(T).IsValueType && value == null)
+	// Do something
+</source>
+
+Также существует проблема с оператором <code>as</code>. Типичная практика сразу делать приведение с помощью оператора <code>as</code> вместо проверки на тип и приведения к нему. Но в случае, если у вас может быть value тип, то лучше всё-таки сначала проверить на тип, а потом привести, потому что оператор <code>as</code> работает только с reference типами, и произойдет сначала боксинг, а затем уже вызов <code>isinst</code>.
+
+<h5>3. Вызовы методов перечислений</h5>
+Перечисления в C# сильно печалят. Проблема в том, что любой вызов метода у перечисления вызывает боксинг:
+
+<source lang="cs">
+[Flags]
+public enum Flags
+{
+	First = 1 << 0,
+	Second = 1 << 1,
+	Third = 1 << 2
+}
+
+public Boolean Foo(Flags flags)
+{
+	return flags.HasFlag(Flags.Second);
+}
+</source>
+
+<source lang="cs">
+IL_0000: ldarg.1
+IL_0001: box HabraTests.Flags
+IL_0006: ldc.i4.2
+IL_0007: box HabraTests.Flags
+IL_000c: call instance bool [mscorlib]System.Enum::HasFlag(class [mscorlib]System.Enum)
+</source>
+
+Более того, даже метод GetHashCode() вызывает боксинг. Поэтому если вам вдруг нужен хэш код от перечисления, то сначала сделайте приведение к его underlying типу. А еще, если вы вдруг используете перечисление как ключ в Dictionary, то сделайте собственный IEqualityComparer, иначе при каждом вызове GetHashCode() будет боксинг.
+
+<h5>4. Перечисления в  generic методах</h5>
+Логичным продолжением пунктов 2 и 3 является желание посмотреть, а как будет вести себя перечисление в generic методе. С одной стороны, если есть реализация метода у value типа, то generic методы умеют вызывать методы интерфейсов у структур без боксинга. С другой стороны, все реализации методов существуют у базового класса <code>Enum</code>, а не у нами созданных перечислений. Напишем небольшой тест, чтобы понять, что происходит внутри.
+
+<spoiler title="Код теста">
+<source lang="cs">
+public static void Main()
+{
+	Double intAverageGrow, enumAverageGrow;
+	Int64 intMinGrow, intMaxGrow, enumMinGrow, enumMaxGrow;
+
+	var result1 = Test<Int32>(() => GetUlong(10), out intAverageGrow, out intMinGrow, out intMaxGrow);
+	var result2 = Test<Flags>(() => GetUlong(Flags.Second), out enumAverageGrow, out enumMinGrow, out enumMaxGrow);
+
+	Console.WriteLine("Int32 memory change. Avg: {0}, Min: {1}, Max: {2}", intAverageGrow, intMinGrow, intMaxGrow);
+	Console.WriteLine("Enum  memory change. Avg: {0}, Min: {1}, Max: {2}", enumAverageGrow, enumMinGrow, enumMaxGrow);
+
+	Console.WriteLine(result1 + result2);
+	Console.ReadKey(true);
+}
+
+public static UInt64 GetUlong<T>(T value)
+	where T : struct, IConvertible
+{
+	return value.ToUInt64(CultureInfo.InvariantCulture);
+}
+
+public static UInt64 Test<T>(Func<UInt64> testedMethod, out Double averageGrow, out Int64 minGrow, out Int64 maxGrow)
+{
+	GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+
+	var previousTotalMemory = GC.GetTotalMemory(false);
+	Int64 growSum = 0;
+	minGrow = 0;
+	maxGrow = 0;
+
+	UInt64 sum = 0;
+	for (var i = 0; i < 100000; i++)
+	{
+		sum += testedMethod();
+
+		var currentTotalMemory = GC.GetTotalMemory(false);
+		var grow = currentTotalMemory - previousTotalMemory;
+		growSum += grow;
+
+		if (minGrow > grow)
+			minGrow = grow;
+
+		if (maxGrow < grow)
+			maxGrow = grow;
+
+		previousTotalMemory = currentTotalMemory;
+	}
+
+	averageGrow = growSum / 100000.0;
+
+	return sum;
+}
+</source>
+</spoiler>
+
+Результат:
+
+<source lang="bash">
+Int32 memory change. Avg: 0, Min: 0, Max: 0
+Enum  memory change. Avg: 3,16756, Min: -2079476, Max: 8192
+</source>
+
+Как мы видим, с перечислениями и тут всё не слава богу: происходит боксинг при каждом вызове метода ToUInt64(). Но зато наглядно видно, что вызов интерфейсного метода у Int32 не вызывает никакого боксинга.
+
+А под конец и отчасти как вывод хочется добавить, что value типы здорово помогают поднять производительность, но нужно внимательно следить за тем, как они используются, иначе в результате боксинга главное их преимущество будет нивелировано. 
+В следующей статье мне хотелось бы рассказать о местах, где неочевидным образом находятся глобальные точки синхронизации, и как их обходить. Stay tuned.
